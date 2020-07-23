@@ -1,4 +1,4 @@
-gatsby-source-faunadb
+gatsby-source-fauna
 
 Source plugin for pulling data into gatsby from faunadb.
 Will setup relationships between documents.
