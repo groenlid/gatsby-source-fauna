@@ -1,9 +1,13 @@
 const { query, Client, values } = require('faunadb')
-
+const { parseJSON, toJSON } = require('faunadb/src/_json')
 const q = query;
 
 function sanitizeName(s) {
   return s.replace(/[^_a-zA-Z0-9]/g, ``).replace(/\b\w/g, l => l.toUpperCase())
+}
+
+function faunaLogger (response) {
+  console.log(`Faunadb query used ${response['responseHeaders']['x-read-ops']} read-ops that took ${response.endTime - response.startTime} ms`)
 }
 
 exports.sourceNodes = async (
@@ -13,7 +17,7 @@ exports.sourceNodes = async (
 
   const { secret, collections } = pluginOptions
 
-  const client = new Client({ secret })
+  const client = new Client({ secret, observer: faunaLogger})
 
   try {
 
@@ -30,20 +34,21 @@ function createNodeIdImp(createNodeId, collection, id) {
 }
 
 async function fetchAllData(client, collection) {
-  console.log(`No cache found from previous build. Fetching all data`);
-  const data = [];
-  let after = null;
+  console.log(`No cache found from previous build. Fetching all data`)
+  const data = []
+
+  let after = null
 
   do {
     const paginatedOpt = after ? {
       after
-    } : undefined;
-    const result = await client.query(q.Map(q.Paginate(q.Documents(q.Collection(collection)), paginatedOpt), q.Lambda(x => q.Get(x))));
-    data.push(...result.data);
-    after = result.after;
-  } while (!!after);
+    } : undefined
+    const result = await client.query(q.Map(q.Paginate(q.Documents(q.Collection(collection)), paginatedOpt), q.Lambda(x => q.Get(x))))
+    data.push(...result.data)
+    after = result.after
+  } while (!!after)
 
-  return data;
+  return data
 }
 
 function getCacheKey(collection) {
@@ -51,24 +56,72 @@ function getCacheKey(collection) {
 }
 
 async function fetchDiffData(client, collection, {
-  timestamp,
   data
 }) {
-  console.log(`Cache found from previous build. Fetching data since: ${new Date(timestamp)}`);
+  let newData = data;
+  const timestamp = Math.max(...data.map(d => d.ts)) + 1
+  console.log(`Cache found from previous build. Fetching data since: ${timestamp}`)
+  console.time(`fetching delta for ${collection}`)
+
+  const paginationHelper = await client.paginate(
+    q.Documents(q.Collection(collection)),
+    { after: timestamp, events: true }
+  );
+  
+
+  await paginationHelper.each((page) => {
+    for (const event of page) {
+      if(event.action !== 'remove') continue;
+      newData = newData.filter(document => !document.ref.equals(event.instance))
+    }
+  })
+  
+  let after = timestamp;
+  do {
+    const paginatedOpt = after ? {
+      after
+    } : undefined;
+    const result = await client.query(
+      q.Map(
+        q.Paginate(
+          q.Select("ref", 
+          q.Get(
+            q.Documents(
+              q.Collection(collection)
+            )
+          )
+        ), 
+        paginatedOpt
+        ),
+        q.Lambda(x => q.Get(x))
+      )
+    )
+    after = result.after;
+
+    for(const entry of result.data) {
+      console.dir({ entry, collection, timestamp })
+
+    }
+    
+  } while(!!after)
+  
+  console.log(`Number of datapoints ${data.length}`)
+
+  console.timeEnd(`fetching delta for ${collection}`)
+
   return data;
 }
 
 async function fetchData(client, collection, cache) {
   const cacheKey = getCacheKey(collection);
-  const timestamp = new Date().getTime();
   const value = await cache.get(cacheKey);
-  const data = value ? await fetchDiffData(client, collection, value) : await fetchAllData(client, collection);
-  const valueToCache = {
-    timestamp,
+  const data = value ? await fetchDiffData(client, collection, parseJSON(value)) : await fetchAllData(client, collection);
+  
+  
+  
+  await cache.set(cacheKey, toJSON({
     data
-  };
-  console.log(`Caching value: `, valueToCache);
-  await cache.set(cacheKey, valueToCache);
+  }));
   return data;
 }
 
