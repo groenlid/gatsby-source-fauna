@@ -29,8 +29,8 @@ exports.sourceNodes = async (
 
 }
 
-function createNodeIdImp(createNodeId, collection, id) {
-  return createNodeId(`faunadb-${sanitizeName(collection)}-${id}`)
+function createNodeIdImp(createNodeId, collectionName, id) {
+  return createNodeId(`faunadb-${sanitizeName(collectionName)}-${id}`)
 }
 
 async function fetchAllData(client, collection) {
@@ -43,83 +43,85 @@ async function fetchAllData(client, collection) {
     const paginatedOpt = after ? {
       after
     } : undefined
-    const result = await client.query(q.Map(q.Paginate(q.Documents(q.Collection(collection)), paginatedOpt), q.Lambda(x => q.Get(x))))
+    const result = await client.query(q.Map(q.Paginate(q.Documents(q.Collection(collection.name)), paginatedOpt), q.Lambda(x => q.Get(x))))
     data.push(...result.data)
     after = result.after
   } while (!!after)
 
-  return data
+  const timestamp = Math.max(...data.map(d => d.ts))
+  return [timestamp, data]
 }
 
 function getCacheKey(collection) {
-  return `faunadb-${collection}`;
+  return `faunadb-${collection.name}`;
 }
 
 async function fetchDiffData(client, collection, {
+  timestamp,
   data
 }) {
   let newData = data;
-  const timestamp = Math.max(...data.map(d => d.ts)) + 1
-  console.log(`Cache found from previous build. Fetching data since: ${timestamp}`)
-  console.time(`fetching delta for ${collection}`)
+  let newTimestamp = timestamp
+  console.log(`Cache found from previous build. Fetching data since: ${timestamp} for collection ${collection.name}`)
+  console.time(`fetching delta for ${collection.name}`)
 
-  const paginationHelper = await client.paginate(
-    q.Documents(q.Collection(collection)),
-    { after: timestamp, events: true }
-  );
+  // Fetching the updated and created documents in the collection
+  let after = timestamp + 1;
+
+  // Finding the created and updated documents
+  const createdAndUpdated = await client.query(
+    q.Map(
+      q.Paginate(
+        q.Range(q.Match(q.Index(collection.tsIndex)), after, null),
+      ),
+      q.Lambda(['ts', 'ref'], q.Paginate(q.Var('ref'), { events: true, after }))
+    )
+  )
+  console.log(createdAndUpdated)
   
 
-  await paginationHelper.each((page) => {
+  // Fetching the updated and created documents
+  const updatedAndCreatedDocuments = await client.paginate(
+    q.Range(q.Match(q.Index(collection.tsIndex)), after, null)
+  )
+
+  await updatedAndCreatedDocuments.each((page) => {
+    for (const document of page) {
+      console.log(document)
+      newTimestamp = document.ts > newTimestamp ? document.ts : newTimestamp;
+    }
+  })
+
+  // Fetching the deleted documents
+  const deletedAndCreatedDocuments = await client.paginate(
+    q.Documents(q.Collection(collection.name)),
+    { after, events: true }
+  )
+
+  await deletedAndCreatedDocuments.each((page) => {
     for (const event of page) {
-      if(event.action !== 'remove') continue;
+      console.log(event)
+      newTimestamp = event.ts > newTimestamp ? event.ts : newTimestamp;
+      if(event.action !== 'remove') continue
       newData = newData.filter(document => !document.ref.equals(event.instance))
     }
   })
-  
-  let after = timestamp;
-  do {
-    const paginatedOpt = after ? {
-      after
-    } : undefined;
-    const result = await client.query(
-      q.Map(
-        q.Paginate(
-          q.Select("ref", 
-          q.Get(
-            q.Documents(
-              q.Collection(collection)
-            )
-          )
-        ), 
-        paginatedOpt
-        ),
-        q.Lambda(x => q.Get(x))
-      )
-    )
-    after = result.after;
 
-    for(const entry of result.data) {
-      console.dir({ entry, collection, timestamp })
-
-    }
-    
-  } while(!!after)
-  
   console.log(`Number of datapoints ${data.length}`)
 
-  console.timeEnd(`fetching delta for ${collection}`)
+  console.timeEnd(`fetching delta for ${collection.name}`)
 
-  return data;
+  // We are still returning the old data and timestamp because the delta fetching is not working yet.
+  return [timestamp, data] //return [newTimestamp, data];
 }
 
 async function fetchData(client, collection, cache) {
   const cacheKey = getCacheKey(collection);
   const value = await cache.get(cacheKey);
-  const data = value ? await fetchDiffData(client, collection, parseJSON(value)) : await fetchAllData(client, collection);
-  
-  
+  const [timestamp, data] = value ? await fetchDiffData(client, collection, parseJSON(value)) : await fetchAllData(client, collection);
   
   await cache.set(cacheKey, toJSON({
+    timestamp,
     data
   }));
   return data;
@@ -146,13 +148,13 @@ async function createNodes({
     }
 
     const node = { ...document.data,
-      id: createNodeIdImp(createNodeId, collection, id),
+      id: createNodeIdImp(createNodeId, collection.name, id),
       _id: id,
       _ts: document.ts,
       parent: null,
       children: [],
       internal: {
-        type: `faunadb${sanitizeName(collection)}`,
+        type: `faunadb${sanitizeName(collection.name)}`,
         content: JSON.stringify(document.data),
         contentDigest: createContentDigest(document.data)
       }

@@ -16,7 +16,7 @@ module.exports = {
         // You can generate on of these in the "Security" tab of your Fauna Console.
         secret: "___YOUR_FAUNADB_SECRET___",
         // Array of the collections you want to injest
-        collections: ["collection1", "collection2"],
+        collections: [{ name: "collection1", tsIndex: "collection1_by_ts" }, { name: "collection2", tsIndex: "collection2_by_ts" }],
       },
     },
     //...
