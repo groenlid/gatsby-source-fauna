@@ -35,20 +35,21 @@ function createNodeIdImp(createNodeId, collectionName, id) {
 
 async function fetchAllData(client, collection) {
   console.log(`No cache found from previous build. Fetching all data`)
-  const data = []
+  const data = {}
 
   let after = null
-
+  let timestamp = null
   do {
     const paginatedOpt = after ? {
       after
     } : undefined
     const result = await client.query(q.Map(q.Paginate(q.Documents(q.Collection(collection.name)), paginatedOpt), q.Lambda(x => q.Get(x))))
-    data.push(...result.data)
+    for(const document of result.data) {
+      data[getIdOfDocumentOrEvent(document)] = document
+      timestamp = Math.max(document.ts, timestamp)
+    }
     after = result.after
   } while (!!after)
-
-  const timestamp = Math.max(...data.map(d => d.ts))
   return [timestamp, data]
 }
 
@@ -56,43 +57,12 @@ function getCacheKey(collection) {
   return `faunadb-${collection.name}`;
 }
 
-async function fetchDiffData(client, collection, {
-  timestamp,
-  data
-}) {
-  let newData = data;
-  let newTimestamp = timestamp
-  console.log(`Cache found from previous build. Fetching data since: ${timestamp} for collection ${collection.name}`)
-  console.time(`fetching delta for ${collection.name}`)
+async function fetchDeletedRefsSinceTimestamp(client, collection, timestamp) {
+  console.time(`fetching deleted documents for ${collection.name} since ${timestamp}`)
+  let after = timestamp + 1
+  let latestTimestampOfEvent = undefined
+  let deletedIds = []
 
-  // Fetching the updated and created documents in the collection
-  let after = timestamp + 1;
-
-  // Finding the created and updated documents
-  const createdAndUpdated = await client.query(
-    q.Map(
-      q.Paginate(
-        q.Range(q.Match(q.Index(collection.tsIndex)), after, null),
-      ),
-      q.Lambda(['ts', 'ref'], q.Paginate(q.Var('ref'), { events: true, after }))
-    )
-  )
-  console.log(createdAndUpdated)
-  
-
-  // Fetching the updated and created documents
-  const updatedAndCreatedDocuments = await client.paginate(
-    q.Range(q.Match(q.Index(collection.tsIndex)), after, null)
-  )
-
-  await updatedAndCreatedDocuments.each((page) => {
-    for (const document of page) {
-      console.log(document)
-      newTimestamp = document.ts > newTimestamp ? document.ts : newTimestamp;
-    }
-  })
-
-  // Fetching the deleted documents
   const deletedAndCreatedDocuments = await client.paginate(
     q.Documents(q.Collection(collection.name)),
     { after, events: true }
@@ -100,31 +70,93 @@ async function fetchDiffData(client, collection, {
 
   await deletedAndCreatedDocuments.each((page) => {
     for (const event of page) {
-      console.log(event)
-      newTimestamp = event.ts > newTimestamp ? event.ts : newTimestamp;
       if(event.action !== 'remove') continue
-      newData = newData.filter(document => !document.ref.equals(event.instance))
+      latestTimestampOfEvent = event.ts > latestTimestampOfEvent ? event.ts : latestTimestampOfEvent;
+      deletedIds.push(getIdOfDocumentOrEvent(event))
     }
   })
 
-  console.log(`Number of datapoints ${data.length}`)
+  return [latestTimestampOfEvent, deletedIds]
+}
 
-  console.timeEnd(`fetching delta for ${collection.name}`)
+async function fetchCreatedAndUpdatedDocumentsSinceTimestamp(client, collection, timestamp) {
+  let after = timestamp + 1
+  let latestTimestampOfEvent = undefined
+  let updatedDocuments = []
 
+  let paginatedOpt = undefined;
+  do {
+    const result = await client.query(
+      q.Map(
+        q.Paginate(
+          q.Range(q.Match(q.Index(collection.tsIndex)), after, null),
+          paginatedOpt
+        ),
+        q.Lambda(
+          ["ts", "ref"],
+          q.Get(q.Var("ref"))
+        )
+      )
+    )
+
+    for(const document of result.data) {
+      updatedDocuments.push(document)
+      timestamp = Math.max(document.ts, timestamp)
+    }
+    paginatedOpt = result.after
+  } while (!!paginatedOpt)
+
+  return [latestTimestampOfEvent, updatedDocuments]
+}
+
+async function fetchDiffData(client, collection, {
+  timestamp,
+  data
+}) {
+  let newData = {...data};
+  console.log(`Cache found from previous build. Fetching data since: ${timestamp} for collection ${collection.name}`)
+
+  const [deletedResult, createdAndUpdatedResult] = await Promise.all([
+    fetchDeletedRefsSinceTimestamp(client, collection, timestamp), 
+    fetchCreatedAndUpdatedDocumentsSinceTimestamp(client, collection, timestamp)
+  ])
+
+  const [lastDeletedTimestamp, deletedRefs] = deletedResult
+  const [lastCreatedOrUpdatedTimestamp, createdOrUpdatedDocuments] = createdAndUpdatedResult
+
+  for(const deletedRef of deletedRefs) {
+    delete newData[deletedRef]
+  }
+
+  for(const createdOrUpdatedDocument of createdOrUpdatedDocuments) {
+    newData[getIdOfDocumentOrEvent(createdOrUpdatedDocument)] = createdOrUpdatedDocument
+  }
+
+  console.log(`Number of datapoints before update ${Object.values(data).length}`)
+  console.log(`Number of datapoints after update ${Object.values(data).length}`)
+  
+  const newTimestamp = Math.max(lastDeletedTimestamp, lastCreatedOrUpdatedTimestamp, timestamp)
   // We are still returning the old data and timestamp because the delta fetching is not working yet.
-  return [timestamp, data] //return [newTimestamp, data];
+  return [newTimestamp, newData]
 }
 
 async function fetchData(client, collection, cache) {
-  const cacheKey = getCacheKey(collection);
-  const value = await cache.get(cacheKey);
-  const [timestamp, data] = value ? await fetchDiffData(client, collection, parseJSON(value)) : await fetchAllData(client, collection);
+  const cacheKey = getCacheKey(collection)
+  const value = await cache.get(cacheKey)
+  const parsedCache = value ? parseJSON(value) : undefined;
+  const [timestamp, data] = parsedCache ? await fetchDiffData(client, collection, parsedCache) : await fetchAllData(client, collection);
   
-  await cache.set(cacheKey, toJSON({
-    timestamp,
-    data
-  }));
-  return data;
+  if(timestamp && (!parsedCache || timestamp !== parsedCache.timestamp)) {
+    await cache.set(cacheKey, toJSON({
+      timestamp,
+      data
+    }));
+  }
+  return Object.values(data);
+}
+
+function getIdOfDocumentOrEvent(documentOrEvent) {
+  return documentOrEvent.ref.id || documentOrEvent.ref["@ref"].id
 }
 
 async function createNodes({
@@ -141,7 +173,7 @@ async function createNodes({
   const data = await fetchData(client, collection, cache);
 
   for (const document of data) {
-    const id = document.ref.id || document.ref["@ref"].id;
+    const id = getIdOfDocumentOrEvent(document);
 
     if (document.data == null) {
       return;
@@ -163,7 +195,7 @@ async function createNodes({
     for (const [key, value] of Object.entries(document.data)) {
       if (value instanceof values.Ref) {
         node[`${key}___NODE`] = createNodeIdImp(createNodeId, value.collection.value.id, value.value.id);
-      } //console.log('Found a ref!!!')
+      }
 
     }
 
